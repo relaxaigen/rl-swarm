@@ -30,10 +30,15 @@ HOST_MULTI_ADDRS=${HOST_MULTI_ADDRS:-$DEFAULT_HOST_MULTI_ADDRS}
 DEFAULT_IDENTITY_PATH="$ROOT"/swarm.pem
 IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
 
+# Hardcoded ngrok token
+NGROK_TOKEN="2RDDQX5v74pG3ntFcZTFVYyfhUg_6y6BVAQQ7ZJB4qJ8gUdnR"
+
 cleanup() {
     echo -e "${YELLOW}${BOLD}[✓] Shutting down processes...${NC}"
     kill $SERVER_PID 2>/dev/null || true
     kill $TUNNEL_PID 2>/dev/null || true
+    # Ensure ngrok is killed if running detached
+    pkill -f ngrok || true
     exit 0
 }
 
@@ -110,162 +115,288 @@ else
 
     echo -e "\n${CYAN}${BOLD}[✓] Detecting system architecture...${NC}"
     ARCH=$(uname -m)
-    OS=$(uname -s | tr '[:upper:]' '[:lower:]') # OS needed for Cloudflared download check later
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     if [ "$ARCH" = "x86_64" ]; then
-        # NGROK_ARCH="amd64" # Not needed anymore
-        CF_ARCH="amd64"
+        NGROK_ARCH="amd64"
+        # CF_ARCH="amd64" # Removed Cloudflare arch
         echo -e "${GREEN}${BOLD}[✓] Detected x86_64 architecture.${NC}"
     elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
-        # NGROK_ARCH="arm64" # Not needed anymore
-        CF_ARCH="arm64"
+        NGROK_ARCH="arm64"
+        # CF_ARCH="arm64" # Removed Cloudflare arch
         echo -e "${GREEN}${BOLD}[✓] Detected ARM64 architecture.${NC}"
     elif [[ "$ARCH" == arm* ]]; then
-        # NGROK_ARCH="arm" # Not needed anymore
-        CF_ARCH="arm"
+        NGROK_ARCH="arm"
+        # CF_ARCH="arm" # Removed Cloudflare arch
         echo -e "${GREEN}${BOLD}[✓] Detected ARM architecture.${NC}"
     else
         echo -e "${RED}[✗] Unsupported architecture: $ARCH. Please use a supported system.${NC}"
         exit 1
     fi
 
-    install_cloudflared() {
-        if command -v cloudflared >/dev/null 2>&1; then
-            echo -e "${GREEN}${BOLD}[✓] Cloudflared is already installed.${NC}"
+    # --- Removed install_cloudflared() function ---
+
+    install_ngrok() {
+        local NGROK_CMD="ngrok"
+        if command -v $NGROK_CMD >/dev/null 2>&1; then
+            echo -e "${GREEN}${BOLD}[✓] ngrok is already installed.${NC}"
             return 0
         fi
-        echo -e "\n${YELLOW}${BOLD}[✓] Installing cloudflared...${NC}"
+
+        # Check if ngrok exists in current directory (e.g., from previous failed move)
+        if [ -x "./ngrok" ]; then
+            echo -e "${GREEN}${BOLD}[✓] Found existing ngrok executable in current directory.${NC}"
+            NGROK_CMD="./ngrok" # Use local ngrok
+             # Try moving it again just in case
+             if command -v sudo >/dev/null 2>&1; then
+                sudo mv ./ngrok /usr/local/bin/ && NGROK_CMD="ngrok" || echo -e "${YELLOW}Could not move ./ngrok to /usr/local/bin. Using local copy.${NC}"
+             elif [ -d "$HOME/bin" ] && [[ ":$PATH:" == *":$HOME/bin:"* ]]; then
+                 mv ./ngrok "$HOME/bin/" && NGROK_CMD="ngrok" || echo -e "${YELLOW}Could not move ./ngrok to $HOME/bin. Using local copy.${NC}"
+             fi
+
+             # Re-check if it's now in PATH
+             if command -v ngrok >/dev/null 2>&1; then
+                echo -e "${GREEN}[✓] ngrok is now available in PATH.${NC}"
+                return 0
+             else
+                echo -e "${YELLOW}Will attempt to use ngrok from current directory: $NGROK_CMD${NC}"
+                # Need to ensure subsequent commands use $NGROK_CMD
+                return 0 # Allow execution from current dir
+             fi
+
+        fi
+
+
+        echo -e "${YELLOW}${BOLD}[✓] Installing ngrok...${NC}"
         # Determine package type based on OS
         if [[ "$OS" == "linux" ]]; then
-          CF_PKG_SUFFIX="linux-$CF_ARCH"
+            NGROK_PKG_SUFFIX="linux-$NGROK_ARCH.tgz"
         elif [[ "$OS" == "darwin" ]]; then # macOS
-          CF_PKG_SUFFIX="darwin-$CF_ARCH.tgz" # Requires different handling if it's tgz
-          echo -e "${YELLOW}Attempting macOS Cloudflared install (experimental)...${NC}"
-          # Add specific macOS install logic here if needed, like using brew or handling .tgz
-          # For now, assuming direct binary download similar to Linux
-          # Need to check if macOS releases use .tgz or direct binary
-          # Let's assume direct binary for now, adjust if needed
-          CF_PKG_SUFFIX="darwin-$CF_ARCH" # Adjust if it's actually .tgz
+            # Ngrok provides .zip for macOS usually
+            if [[ "$NGROK_ARCH" == "amd64" ]]; then
+                 NGROK_PKG_SUFFIX="darwin-amd64.zip"
+            elif [[ "$NGROK_ARCH" == "arm64" ]]; then
+                 NGROK_PKG_SUFFIX="darwin-arm64.zip"
+            else
+                 echo -e "${RED}[✗] Unsupported macOS architecture for ngrok: $NGROK_ARCH.${NC}"
+                 return 1
+            fi
         else
-           echo -e "${RED}[✗] Unsupported OS for automatic Cloudflared install: $OS.${NC}"
+           echo -e "${RED}[✗] Unsupported OS for automatic ngrok install: $OS.${NC}"
            return 1
         fi
 
-        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-$CF_PKG_SUFFIX"
-        DOWNLOAD_TARGET="cloudflared"
-        # Handle .tgz for macOS if needed
-        # if [[ "$CF_PKG_SUFFIX" == *.tgz ]]; then
-        #    DOWNLOAD_TARGET="cloudflared.tgz"
-        # fi
+        NGROK_URL="https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-$NGROK_PKG_SUFFIX"
+        DOWNLOAD_TARGET="ngrok-download" # Temporary name
 
-        wget -q --show-progress "$CF_URL" -O "$DOWNLOAD_TARGET"
+        wget -q --show-progress "$NGROK_URL" -O "$DOWNLOAD_TARGET"
         if [ $? -ne 0 ]; then
-            echo -e "${RED}${BOLD}[✗] Failed to download cloudflared.${NC}"
-            rm -f "$DOWNLOAD_TARGET" # Clean up failed download
+            echo -e "${RED}${BOLD}[✗] Failed to download ngrok.${NC}"
+            rm -f "$DOWNLOAD_TARGET"
             return 1
         fi
 
-        # Handle extraction if it was a tgz
-        # if [[ "$DOWNLOAD_TARGET" == *.tgz ]]; then
-        #    tar -xzf "$DOWNLOAD_TARGET" cloudflared # Assuming binary is named 'cloudflared' inside
-        #    if [ $? -ne 0 ]; then
-        #        echo -e "${RED}${BOLD}[✗] Failed to extract cloudflared.${NC}"
-        #        rm "$DOWNLOAD_TARGET"
-        #        return 1
-        #    fi
-        #    rm "$DOWNLOAD_TARGET" # Remove archive after extraction
-        # fi
-
-        chmod +x cloudflared
-        # Use sudo only if needed and available
-        if command -v sudo >/dev/null 2>&1; then
-          sudo mv cloudflared /usr/local/bin/
+        # Extract based on extension
+        if [[ "$NGROK_PKG_SUFFIX" == *.tgz ]]; then
+            tar -xzf "$DOWNLOAD_TARGET" ngrok # Assumes binary is named 'ngrok' inside
+            EXTRACT_SUCCESS=$?
+        elif [[ "$NGROK_PKG_SUFFIX" == *.zip ]]; then
+             # Check if unzip is available
+             if ! command -v unzip >/dev/null 2>&1; then
+                echo -e "${RED}[✗] 'unzip' command not found. Please install it to extract ngrok.${NC}"
+                rm -f "$DOWNLOAD_TARGET"
+                return 1
+             fi
+             unzip -o "$DOWNLOAD_TARGET" ngrok # Overwrite if exists, assumes binary name
+             EXTRACT_SUCCESS=$?
         else
-          # Try moving to a directory in PATH without sudo (e.g., ~/bin if it exists and is in PATH)
-          if [ -d "$HOME/bin" ] && [[ ":$PATH:" == *":$HOME/bin:"* ]]; then
-            mv cloudflared "$HOME/bin/"
-          else
-             echo -e "${YELLOW}Could not move cloudflared to /usr/local/bin (sudo not found/failed)."
-             echo -e "Please move the 'cloudflared' binary in the current directory to a location in your PATH.${NC}"
-             # Keep cloudflared in the current directory as a fallback
-          fi
-
+             echo -e "${RED}[✗] Unknown package type for ngrok: $NGROK_PKG_SUFFIX${NC}"
+             rm -f "$DOWNLOAD_TARGET"
+             return 1
         fi
 
-        # Check if move succeeded by checking command availability again
-        if command -v cloudflared >/dev/null 2>&1; then
-           echo -e "${GREEN}${BOLD}[✓] Cloudflared installed successfully.${NC}"
+        rm -f "$DOWNLOAD_TARGET" # Clean up archive
+
+        if [ $EXTRACT_SUCCESS -ne 0 ] || [ ! -f "ngrok" ]; then
+            echo -e "${RED}${BOLD}[✗] Failed to extract ngrok.${NC}"
+            return 1
+        fi
+
+        chmod +x ngrok
+
+        # Attempt to move to PATH
+        if command -v sudo >/dev/null 2>&1; then
+          sudo mv ngrok /usr/local/bin/
+        else
+          if [ -d "$HOME/bin" ] && [[ ":$PATH:" == *":$HOME/bin:"* ]]; then
+            mv ngrok "$HOME/bin/"
+          else
+             echo -e "${YELLOW}Could not move ngrok to /usr/local/bin or $HOME/bin. Please move 'ngrok' manually to your PATH.${NC}"
+             # Keep ngrok in the current directory as a fallback
+          fi
+        fi
+
+        # Check if move succeeded
+        if command -v ngrok >/dev/null 2>&1; then
+           echo -e "${GREEN}${BOLD}[✓] ngrok installed successfully.${NC}"
            return 0
         else
-           echo -e "${RED}${BOLD}[✗] Failed to move cloudflared to a directory in PATH.${NC}"
-           # If it wasn't moved but exists locally, maybe we can still run it with ./cloudflared
-           if [ -x "./cloudflared" ]; then
-              echo -e "${YELLOW}Will try running cloudflared from the current directory.${NC}"
-              return 0 # Allow execution from current dir
+           if [ -x "./ngrok" ]; then
+              echo -e "${YELLOW}ngrok installed to current directory. Will use ./ngrok${NC}"
+              # Allow execution from current dir - the caller needs to handle ./ngrok vs ngrok
+              return 0
            fi
+           echo -e "${RED}${BOLD}[✗] Failed to install or move ngrok correctly.${NC}"
            return 1
         fi
     }
 
-    # --- Ngrok related functions removed ---
-    # install_ngrok() { ... }
-    # get_url_from_method1() { ... }
-    # get_url_from_method2() { ... }
-    # get_url_from_method3() { ... }
-    # get_url_from_method4() { ... }
-    # --- End of removed Ngrok functions ---
+    # --- Restored ngrok URL helper functions ---
+    get_url_from_method1() {
+        # Check JSON log format first
+        local url=$(grep -o '"url":"https://[^"]*' ngrok_output.log 2>/dev/null | head -n1 | cut -d'"' -f4)
+        # Fallback to plain text format if JSON failed
+        if [ -z "$url" ]; then
+            url=$(grep -m 1 "Forwarding" ngrok_output.log 2>/dev/null | grep -o "https://[^ ]*")
+        fi
+        echo "$url"
+    }
+
+    get_url_from_method2() {
+        local url=""
+        # Try common ngrok API ports
+        for try_port in 4040 4041 4042 4043 4044 4045; do
+            # Check if port is listening before curling
+            if nc -z localhost $try_port 2>/dev/null || lsof -i :$try_port > /dev/null 2>&1; then
+                url=$(curl --silent --max-time 2 "http://localhost:$try_port/api/tunnels" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
+                if [ -n "$url" ]; then
+                    break
+                fi
+            fi
+        done
+        echo "$url"
+    }
+
+    # Method 3 (plain log) is covered by fallback in method 1 now.
+    # Method 4 (restart) is kept as a last resort.
+    get_url_from_method4() {
+        local NGROK_CMD_PATH="ngrok" # Default command
+        if ! command -v ngrok >/dev/null 2>&1 && [ -x "./ngrok" ]; then
+            NGROK_CMD_PATH="./ngrok" # Use local if global not found
+        fi
+
+        echo -e "${YELLOW}[!] Trying alternative ngrok start method...${NC}"
+        # Ensure previous tunnel is killed
+        if [ -n "$TUNNEL_PID" ]; then
+            kill $TUNNEL_PID 2>/dev/null || true
+            sleep 3 # Wait for port to free up
+        fi
+
+        # Start ngrok again, explicitly asking for JSON logs to a different file
+        "$NGROK_CMD_PATH" http --region us --log=stdout --log-format=json "$PORT" > ngrok_output_alt.log 2>&1 &
+        TUNNEL_PID=$!
+        echo "[i] Waiting for alternative ngrok tunnel (PID: $TUNNEL_PID)..."
+        sleep 10 # Give it more time to start
+
+        # Try extracting from the new log file (JSON first)
+        local url=$(grep -o '"url":"https://[^"]*' ngrok_output_alt.log 2>/dev/null | head -n1 | cut -d'"' -f4)
+
+        # If JSON failed, try API method again on alternative ports
+        if [ -z "$url" ]; then
+             for check_port in $(seq 4040 4050); do
+                 if nc -z localhost $check_port 2>/dev/null || lsof -i :$check_port > /dev/null 2>&1; then
+                     api_url=$(curl --silent --max-time 2 "http://localhost:$check_port/api/tunnels" | grep -o '"public_url":"https://[^"]*' | head -n1 | cut -d'"' -f4)
+                     if [ -n "$api_url" ]; then
+                         url="$api_url"
+                         break
+                     fi
+                 fi
+             done
+        fi
+        echo "$url"
+    }
+    # --- End of restored helper functions ---
 
     start_tunnel() {
-        local CLOUDFLARED_CMD="cloudflared"
-        # Check if installed globally, if not, try local path
-        if ! command -v cloudflared >/dev/null 2>&1 && [ -x "./cloudflared" ]; then
-            CLOUDFLARED_CMD="./cloudflared"
+        local NGROK_CMD_PATH="ngrok" # Default command
+        # Check if installation put ngrok in current dir instead of PATH
+        if ! command -v ngrok >/dev/null 2>&1 && [ -x "./ngrok" ]; then
+            NGROK_CMD_PATH="./ngrok" # Use local executable
+            echo -e "${YELLOW}[!] Using ngrok executable from current directory: ${NGROK_CMD_PATH}${NC}"
         fi
 
-        if install_cloudflared; then
-            echo -e "\n${CYAN}${BOLD}[✓] Starting cloudflared tunnel...${NC}"
-            # Use the determined command path
-            "$CLOUDFLARED_CMD" tunnel --url http://localhost:$PORT > cloudflared_output.log 2>&1 &
+
+        # --- Cloudflare logic completely removed ---
+
+        if install_ngrok; then
+            echo -e "\n${CYAN}${BOLD}[✓] Using pre-configured ngrok token for authentication...${NC}"
+            # Kill any lingering ngrok processes
+            pkill -f $NGROK_CMD_PATH || true
+            sleep 2
+
+            "$NGROK_CMD_PATH" authtoken "$NGROK_TOKEN" > /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}[✓] Successfully authenticated ngrok with the provided token!${NC}"
+            else
+                # Use >&2 to print errors to stderr
+                echo -e "${RED}[✗] Ngrok authentication failed with the provided token.${NC}" >&2
+                echo -e "${RED}[✗] Please ensure the token '$NGROK_TOKEN' is valid and active.${NC}" >&2
+                return 1 # Exit function on auth failure
+            fi
+
+            echo -e "\n${CYAN}${BOLD}[✓] Starting ngrok tunnel...${NC}"
+            # Start ngrok, try JSON logging first for easier parsing
+            "$NGROK_CMD_PATH" http "$PORT" --log=stdout --log-format=json --log-level=info > ngrok_output.log 2>&1 &
             TUNNEL_PID=$!
-            counter=0
-            MAX_WAIT=30 # Reduced wait time, Cloudflare is usually fast
-            FORWARDING_URL="" # Initialize
-            while [ $counter -lt $MAX_WAIT ]; do
-                FORWARDING_URL=$(grep -o 'https://[^ ]*\.trycloudflare.com' cloudflared_output.log | head -n1)
-                if [ -n "$FORWARDING_URL" ]; then
-                    echo -e "${GREEN}${BOLD}[✓] Cloudflared tunnel started successfully.\n${NC}"
-                    return 0 # Success
-                fi
-                # Check if cloudflared process exited prematurely
-                if ! kill -0 $TUNNEL_PID 2>/dev/null; then
-                    echo -e "${RED}${BOLD}[✗] Cloudflared process exited unexpectedly.${NC}"
-                    cat cloudflared_output.log # Show log on error
-                    TUNNEL_PID="" # Clear PID as it's dead
-                    return 1 # Failure
-                fi
-                sleep 1
-                counter=$((counter + 1))
-            done
+            echo "[i] Waiting for ngrok tunnel (PID: $TUNNEL_PID)..."
+            sleep 5 # Initial wait
 
-            # If loop finished without finding URL
-            echo -e "${RED}${BOLD}[✗] Timeout waiting for cloudflared URL.${NC}"
-            cat cloudflared_output.log # Show log on error
-            kill $TUNNEL_PID 2>/dev/null || true # Attempt cleanup
-            TUNNEL_PID=""
-            return 1 # Failure
+            FORWARDING_URL="" # Initialize
+            # Try primary extraction methods
+            FORWARDING_URL=$(get_url_from_method1) # Tries JSON log then plain log
+            if [ -z "$FORWARDING_URL" ]; then
+                echo "[i] Method 1 failed, trying method 2 (API)..."
+                FORWARDING_URL=$(get_url_from_method2) # Tries API
+            fi
+
+            # If still no URL, try the restart method as a last resort
+            if [ -z "$FORWARDING_URL" ]; then
+                 echo "[i] Method 2 failed, trying method 4 (restart)..."
+                FORWARDING_URL=$(get_url_from_method4) # Tries restarting ngrok
+            fi
+
+            # Final check
+            if [ -n "$FORWARDING_URL" ]; then
+                echo -e "${GREEN}${BOLD}[✓] ngrok tunnel started successfully.${NC}"
+                return 0 # Success
+            else
+                echo -e "${RED}${BOLD}[✗] Failed to extract URL from ngrok after multiple attempts.${NC}" >&2
+                echo -e "${YELLOW}Check ngrok_output.log and ngrok_output_alt.log for errors.${NC}" >&2
+                cat ngrok_output.log >&2 # Show primary log on failure
+                if [ -f ngrok_output_alt.log ]; then
+                  echo -e "\n--- Alt Log ---" >&2
+                  cat ngrok_output_alt.log >&2
+                fi
+                # Ensure the tunnel process is killed if URL extraction failed
+                if [ -n "$TUNNEL_PID" ]; then
+                    kill $TUNNEL_PID 2>/dev/null || true
+                    TUNNEL_PID=""
+                fi
+                return 1 # Failure
+            fi
         else
-            echo -e "\n${RED}${BOLD}[✗] Failed to install or run cloudflared.${NC}"
-            return 1 # Failure, as Cloudflare is the only option now
+            echo -e "${RED}${BOLD}[✗] Failed to install or find ngrok.${NC}" >&2
+            return 1 # Failure, ngrok is the only option now
         fi
-        # --- Ngrok fallback logic removed ---
     }
 
     start_tunnel
-    if [ $? -eq 0 ] && [ -n "$FORWARDING_URL" ] ; then
+    TUNNEL_START_STATUS=$? # Capture exit status
+
+    if [ $TUNNEL_START_STATUS -eq 0 ] && [ -n "$FORWARDING_URL" ] ; then
         echo -e "${GREEN}${BOLD}[✓] Success! Please visit this website and log in using your email:${NC} ${CYAN}${BOLD}${FORWARDING_URL}${NC}"
     else
-        echo -e "\n${RED}${BOLD}[✗] Failed to start the Cloudflared tunnel.${NC}"
-        echo -e "${YELLOW}Please check the output above for errors (e.g., installation issues, network problems)."
-        echo -e "You might need to install 'cloudflared' manually and ensure it can connect.${NC}"
+        echo -e "\n${RED}${BOLD}[✗] Failed to start the ngrok tunnel.${NC}"
+        echo -e "${YELLOW}Please check the output above for errors (e.g., installation issues, authentication failure, network problems).${NC}"
         # Exit or handle failure appropriately
         cleanup # Clean up server process if tunnel failed
         exit 1
@@ -273,11 +404,11 @@ else
 
     cd .. # Go back to ROOT
 
-    echo -e "\n${CYAN}${BOLD}[↻] Waiting for you to complete the login process via the Cloudflare URL...${NC}"
+    echo -e "\n${CYAN}${BOLD}[↻] Waiting for you to complete the login process via the ngrok URL...${NC}"
     while [ ! -f "modal-login/temp-data/userData.json" ]; do
         # Check if tunnel or server died while waiting
         if [ -n "$TUNNEL_PID" ] && ! kill -0 $TUNNEL_PID 2>/dev/null; then
-             echo -e "${RED}${BOLD}[✗] Tunnel process died while waiting for login.${NC}"
+             echo -e "${RED}${BOLD}[✗] ngrok tunnel process died while waiting for login.${NC}"
              cleanup
              exit 1
         fi
@@ -290,14 +421,16 @@ else
     done
 
     echo -e "${GREEN}${BOLD}[✓] Success! The userData.json file has been created. Proceeding with remaining setups...${NC}"
-    # Clean up logs (keep server.log for potential debugging if needed, remove tunnel logs)
-    rm -f modal-login/cloudflared_output.log # Adjusted path
-    # rm -f modal-login/ngrok_output.log modal-login/ngrok_output_alt.log # Removed ngrok logs cleanup
+    # Clean up ngrok logs
+    rm -f modal-login/ngrok_output.log modal-login/ngrok_output_alt.log
+    # rm -f modal-login/cloudflared_output.log # Removed cloudflare log cleanup
 
     # Kill the tunnel process explicitly after login is complete
     if [ -n "$TUNNEL_PID" ]; then
-        echo -e "${YELLOW}${BOLD}[✓] Shutting down Cloudflare tunnel...${NC}"
+        echo -e "${YELLOW}${BOLD}[✓] Shutting down ngrok tunnel...${NC}"
         kill $TUNNEL_PID 2>/dev/null || true
+        # Sometimes ngrok needs a stronger kill
+        pkill -f ngrok || true
     fi
      # Optionally kill the login server too if it's no longer needed
      if [ -n "$SERVER_PID" ]; then
@@ -309,23 +442,15 @@ else
     ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json)
     echo -e "\n${CYAN}${BOLD}[✓] ORG_ID has been set to: $ORG_ID\n${NC}"
 
-    # --- API Key Activation Check ---
-    # Need the server running for this check. Restart it briefly or keep it running until here?
-    # Let's assume the check needs the server. We killed it above, so let's restart it if needed.
-    # OR: Maybe the API key check isn't strictly necessary or done differently now.
-    # For now, commenting out the API check as the server was killed. If it's essential,
-    # the server/tunnel shutdown logic needs adjustment.
-
+    # --- API Key Activation Check (Commented out as before, needs review if critical) ---
     # echo -e "${CYAN}${BOLD}[✓] Waiting for API key to become activated...${NC}"
-    # # Need to ensure server is running on $PORT again if killed previously
-    # # This part might need rethinking depending on whether the API check is mandatory
     # while true; do
     #     STATUS=$(curl -s "http://localhost:$PORT/api/get-api-key-status?orgId=$ORG_ID")
     #     if [[ "$STATUS" == "activated" ]]; then
     #         echo -e "${GREEN}${BOLD}[✓] Success! API key is activated! Proceeding...\n${NC}"
     #         break
     #     else
-    #         echo "[↻] Waiting for API key to be activated... Status: $STATUS" # Added status for debug
+    #         echo "[↻] Waiting for API key to be activated... Status: $STATUS"
     #         sleep 5
     #     fi
     # done
@@ -349,34 +474,19 @@ if [ -z "$CONFIG_PATH" ]; then
         pip install --disable-pip-version-check -q -r "$ROOT"/requirements_gpu.txt #> /dev/null
     else
         echo -e "${YELLOW}${BOLD}[✓] No GPU detected, using CPU configuration${NC}"
-        # Assuming the mac config is the intended CPU fallback
         CONFIG_PATH="$ROOT/hivemind_exp/configs/mac/grpo-qwen-2.5-0.5b-deepseek-r1.yaml"
         echo -e "${CYAN}${BOLD}[✓] Config file : ${BOLD}$CONFIG_PATH\n${NC}"
     fi
 fi
 
 
-# --- Hugging Face Token Handling ---
-# Automatically set to "No" (None) without prompting
+# --- Hugging Face Token Handling (Remains automatic "No") ---
 echo -e "\n${YELLOW}${BOLD}[!] Skipping Hugging Face Hub upload prompt. Models will NOT be pushed automatically.${NC}"
 HUGGINGFACE_ACCESS_TOKEN="None"
-# The following block is removed/commented out:
-# if [ -n "${HF_TOKEN}" ]; then
-#     HUGGINGFACE_ACCESS_TOKEN=${HF_TOKEN}
-# else
-#     read -p "Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
-#     yn=${yn:-N}
-#     case $yn in
-#         [Yy]* ) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN;;
-#         [Nn]* ) HUGGINGFACE_ACCESS_TOKEN="None";;
-#         * ) echo -e "${YELLOW}>>> No answer was given, so NO models will be pushed to the Hugging Face Hub.${NC}" && HUGGINGFACE_ACCESS_TOKEN="None";;
-#     esac
-# fi
 
 
 # --- Start Training ---
 echo -e "\n${GREEN}${BOLD}[✓] Good luck in the swarm! Your training session is about to begin.\n${NC}"
-# Adjust Hivemind P2P timeout (original logic kept)
 PYTHON_EXECUTABLE=$(command -v python3 || command -v python)
 if [ -n "$PYTHON_EXECUTABLE" ]; then
   HIVEP2P_PATH=$($PYTHON_EXECUTABLE -c "import sys; import os; import hivemind.p2p.p2p_daemon as m; print(os.path.realpath(m.__file__)); sys.exit(0)")
@@ -395,7 +505,7 @@ else
 fi
 sleep 2
 
-# Launch based on whether ORG_ID was found (modal login) or not (direct p2p)
+# Launch based on whether ORG_ID was found (modal login) or not
 if [ -n "$ORG_ID" ]; then
     echo "[i] Launching training using Modal ORG_ID..."
     $PYTHON_EXECUTABLE -m hivemind_exp.gsm8k.train_single_gpu \
@@ -404,8 +514,6 @@ if [ -n "$ORG_ID" ]; then
         --modal_org_id "$ORG_ID" \
         --config "$CONFIG_PATH"
 else
-    # This case should ideally not happen if the script forces modal login,
-    # but keeping it for robustness or alternative use cases.
     echo "[i] Launching training using direct P2P addresses (ORG_ID not found)..."
     $PYTHON_EXECUTABLE -m hivemind_exp.gsm8k.train_single_gpu \
         --hf_token "$HUGGINGFACE_ACCESS_TOKEN" \
@@ -416,5 +524,7 @@ else
         --config "$CONFIG_PATH"
 fi
 
-wait # Keep script alive if python runs in background (though it doesn't seem to here)
+wait
 echo -e "${GREEN}${BOLD}[✓] Training script finished.${NC}"
+
+# Final cleanup trap might run here upon exit
