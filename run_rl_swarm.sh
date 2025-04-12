@@ -31,7 +31,7 @@ DEFAULT_IDENTITY_PATH="$ROOT"/swarm.pem
 IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
 
 # Hardcoded ngrok token
-NGROK_TOKEN="2RDDQX5v74pG3ntFcZTFVYyfhUg_6y6BVAQQ7ZJB4qJ8gUdnR"
+NGROK_TOKEN="2vUzlOzoWHKs25fsh1PvRB4yeND_3erVdiAizJxNP5XLtVaBo"
 
 cleanup() {
     echo -e "${YELLOW}${BOLD}[✓] Shutting down processes...${NC}"
