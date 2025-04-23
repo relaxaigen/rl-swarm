@@ -258,18 +258,32 @@ if [ "$CONNECT_TO_TESTNET" = "True" ]; then
     echo_green ">> Started ngrok process (PID: $NGROK_PID)."
 
     # 6. Get Ngrok URL and Wait for Login
+        # 6. Get Ngrok URL and Wait for Login
     echo_blue ">> [6/7] Waiting for ngrok tunnel URL and user login..."
     NGROK_URL=""
     echo_yellow ">> Fetching ngrok public URL (up to 30 seconds)..."
-    for i in {1..15}; do # 15 attempts * 2 seconds = 30 seconds timeout
-        # Method 1: Try ngrok API (more reliable)
-        NGROK_URL=$(curl --silent --max-time 1.5 http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"https://[^"]*' | cut -d'"' -f4 | head -n 1)
+    # Add a small delay AFTER starting ngrok, BEFORE the loop
+    sleep 2
+    echo_yellow "   (Initial delay complete, now polling ngrok API/log...)"
 
-        # Method 2: Fallback to parsing log file (if API fails or is slow)
+    for i in {1..15}; do # 15 attempts * ~2 seconds = ~30 seconds timeout
+        # Method 1: Try ngrok API (more reliable) - ADD || true at the end
+        # Use -f (--fail) with curl to make it return non-zero on server errors (like 404)
+        API_OUTPUT=$(curl --silent --fail --max-time 1.5 http://127.0.0.1:4040/api/tunnels || echo "api_failed")
+        if [[ "$API_OUTPUT" != "api_failed" ]]; then
+            NGROK_URL=$(echo "$API_OUTPUT" | grep -o '"public_url":"https://[^"]*' | cut -d'"' -f4 | head -n 1 || true) # Added || true here
+        else
+            NGROK_URL="" # Ensure URL is empty if API failed
+            echo_yellow "   (Ngrok API call failed, attempt $i)"
+        fi
+
+        # Method 2: Fallback to parsing log file (if API fails or URL is empty)
         if [ -z "$NGROK_URL" ] && [ -f "$NGROK_LOG_FILE" ]; then
-            # Look for lines like 'url=https://....ngrok...' or 'URL:https://....ngrok...'
-            # Prioritize https URLs
-            NGROK_URL=$(grep -Eo 'url=(https://[a-zA-Z0-9.-]+\.ngrok[-a-z.]+)' "$NGROK_LOG_FILE" | head -n 1 | cut -d'=' -f2)
+             # Add || true to the grep as well, just in case
+            NGROK_URL=$(grep -Eo 'url=(https://[a-zA-Z0-9.-]+\.ngrok[-a-z.]+)' "$NGROK_LOG_FILE" | head -n 1 | cut -d'=' -f2 || true)
+             if [ -n "$NGROK_URL" ]; then
+                echo_yellow "   (URL found via log file fallback)"
+             fi
         fi
 
         if [ -n "$NGROK_URL" ]; then
@@ -280,12 +294,15 @@ if [ "$CONNECT_TO_TESTNET" = "True" ]; then
         sleep 2
     done
 
+    # ... (rest of the script remains the same) ...
+
     if [ -z "$NGROK_URL" ]; then
-        echo_red "Error: Could not get ngrok tunnel URL after 30 seconds."
+        echo_red "Error: Could not get ngrok tunnel URL after ~30 seconds."
         echo_yellow "Troubleshooting steps:"
         echo_yellow "  1. Check your internet connection."
-        echo_yellow "  2. Manually run 'ngrok http 3000' in another terminal to see errors."
-        echo_yellow "  3. Check the ngrok log file: $NGROK_LOG_FILE"
+        echo_yellow "  2. Check the ngrok log file for errors: $NGROK_LOG_FILE"
+        echo_yellow "  3. Try running 'ngrok http 3000' manually in another terminal."
+        echo_yellow "  4. Ensure nothing is blocking localhost communication on port 4040."
         exit 1 # Exit after cleanup (handled by trap)
     fi
 
