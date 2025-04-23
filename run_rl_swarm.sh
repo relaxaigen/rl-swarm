@@ -66,30 +66,39 @@ NGROK_LOG_FILE="$ROOT_DIR/ngrok.log" # Define log file path
 
 # Function to clean up the server and ngrok process upon exit
 cleanup() {
-    echo_green ">> Shutting down trainer..."
+    # --- IMPORTANT: Disable traps immediately to prevent recursive calls ---
+    trap - EXIT INT TERM
+
+    echo_green ">> Shutting down trainer..." # Ye ab sirf ek baar print hona chahiye
 
     # Remove modal credentials if they exist
-    rm -r $ROOT_DIR/modal-login/temp-data/*.json 2> /dev/null || true
+    # Added quotes for robustness with paths containing spaces (though unlikely here)
+    rm -r "$ROOT_DIR/modal-login/temp-data/"*.json 2> /dev/null || true
 
     # Kill ngrok process if it was started
     if [ -n "$NGROK_PID" ]; then
          echo_yellow ">> Shutting down ngrok tunnel (PID: $NGROK_PID)..."
+         # Use quotes around PID variable
          kill "$NGROK_PID" 2>/dev/null || true
+         # Use quotes around file variable
          rm -f "$NGROK_LOG_FILE" # Clean up ngrok log file
     fi
 
     # Kill the local server process if it was started
     if [ -n "$SERVER_PID" ]; then
          echo_yellow ">> Shutting down local server (PID: $SERVER_PID)..."
+         # Use quotes around PID variable
          kill "$SERVER_PID" 2>/dev/null || true
     fi
 
     # Kill all processes belonging to this script's process group as a fallback
-    echo_yellow ">> Attempting to kill remaining processes in group..."
-    kill -- -$$ || true
+    # This is now safer as traps are disabled
+    echo_yellow ">> Attempting to kill remaining processes in group (final check)..."
+    # Redirect stderr to prevent potential "Terminated" messages to console
+    kill -- -$$ 2>/dev/null || true
 
     echo_green ">> Cleanup complete."
-    exit 0
+    # No need for explicit 'exit 0' here - the script will exit naturally after the trap handler finishes.
 }
 
 # Set trap to call cleanup function on EXIT, INT (Ctrl+C), TERM signals
