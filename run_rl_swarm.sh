@@ -1,109 +1,94 @@
 #!/bin/bash
 
+# Exit immediately if a command exits with a non-zero status.
+# Treat unset variables as an error when substituting.
+# Pipeli nes return the exit status of the last command to exit with a non-zero status.
 set -euo pipefail
 
-# General arguments
-ROOT=$PWD
+# --- Configuration ---
+ROOT=$PWD # Assuming the script is run from the project root
 
-export PUB_MULTI_ADDRS
-export PEER_MULTI_ADDRS
-export HOST_MULTI_ADDRS
-export IDENTITY_PATH
-export CONNECT_TO_TESTNET
-export ORG_ID
-export HF_HUB_DOWNLOAD_TIMEOUT=120  # 2 minutes
-
-# Check if public multi-address is given else set to default
+# Default values (can be overridden by environment variables)
 DEFAULT_PUB_MULTI_ADDRS=""
-PUB_MULTI_ADDRS=${PUB_MULTI_ADDRS:-$DEFAULT_PUB_MULTI_ADDRS}
-
-# Check if peer multi-address is given else set to default
 DEFAULT_PEER_MULTI_ADDRS="/ip4/38.101.215.13/tcp/30002/p2p/QmQ2gEXoPJg6iMBSUFWGzAabS2VhnzuS782Y637hGjfsRJ" # gensyn coordinator node
-PEER_MULTI_ADDRS=${PEER_MULTI_ADDRS:-$DEFAULT_PEER_MULTI_ADDRS}
-
-# Check if host multi-address is given else set to default
 DEFAULT_HOST_MULTI_ADDRS="/ip4/0.0.0.0/tcp/38331"
-HOST_MULTI_ADDRS=${HOST_MULTI_ADDRS:-$DEFAULT_HOST_MULTI_ADDRS}
+DEFAULT_IDENTITY_PATH="$ROOT/swarm.pem"
 
-# Path to an RSA private key. If this path does not exist, a new key pair will be created.
-# Remove this file if you want a new PeerID.
-DEFAULT_IDENTITY_PATH="$ROOT"/swarm.pem
-IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
+# Export or set variables with defaults
+export PUB_MULTI_ADDRS=${PUB_MULTI_ADDRS:-$DEFAULT_PUB_MULTI_ADDRS}
+export PEER_MULTI_ADDRS=${PEER_MULTI_ADDRS:-$DEFAULT_PEER_MULTI_ADDRS}
+export HOST_MULTI_ADDRS=${HOST_MULTI_ADDRS:-$DEFAULT_HOST_MULTI_ADDRS}
+export IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
+export CPU_ONLY=${CPU_ONLY:-""} # Will ignore GPUs if set to non-empty string
+export HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-120} # 2 minutes
 
-# Will ignore any visible GPUs if set.
-CPU_ONLY=${CPU_ONLY:-""}
+# Script internal variables
+CONNECT_TO_TESTNET="" # Will be set based on user input
+ORG_ID=""             # Will be set if Testnet connection is successful
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # Script's own directory
+NGROK_PID=""          # Store ngrok process ID
+SERVER_PID=""         # Store local server process ID
+NGROK_LOG_FILE="$ROOT_DIR/ngrok.log" # Path for ngrok log file
 
-# Set if successfully parsed from modal-login/temp-data/userData.json.
-ORG_ID=${ORG_ID:-""}
-
+# --- Text Colors ---
 GREEN_TEXT="\033[32m"
 BLUE_TEXT="\033[34m"
-YELLOW_TEXT="\033[33m" # Added yellow for warnings/prompts
-RED_TEXT="\033[31m"   # Added red for errors
+YELLOW_TEXT="\033[33m"
+RED_TEXT="\033[31m"
 RESET_TEXT="\033[0m"
 
-echo_green() {
-    echo -e "$GREEN_TEXT$1$RESET_TEXT"
-}
+# --- Helper Functions ---
+echo_green() { echo -e "${GREEN_TEXT}$1${RESET_TEXT}"; }
+echo_blue() { echo -e "${BLUE_TEXT}$1${RESET_TEXT}"; }
+echo_yellow() { echo -e "${YELLOW_TEXT}$1${RESET_TEXT}"; }
+echo_red() { echo -e "${RED_TEXT}$1${RESET_TEXT}"; }
 
-echo_blue() {
-    echo -e "$BLUE_TEXT$1$RESET_TEXT"
-}
-
-echo_yellow() {
-    echo -e "$YELLOW_TEXT$1$RESET_TEXT"
-}
-
-echo_red() {
-    echo -e "$RED_TEXT$1$RESET_TEXT"
-}
-
-
-ROOT_DIR="$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)"
-NGROK_PID="" # Initialize NGROK_PID
-SERVER_PID="" # Initialize SERVER_PID
-NGROK_LOG_FILE="$ROOT_DIR/ngrok.log" # Define log file path
-
-# Function to clean up the server and ngrok process upon exit
+# --- Cleanup Function ---
+# This function is called on script exit (normal or interrupted)
 cleanup() {
-    # --- IMPORTANT: Disable traps immediately to prevent recursive calls ---
+    # Disable further traps to prevent recursion
     trap - EXIT INT TERM
 
-    echo_green ">> Shutting down trainer..." # Ye ab sirf ek baar print hona chahiye
+    echo_green "\n>> Shutting down trainer..."
 
     # Remove modal credentials if they exist
-    # Added quotes for robustness with paths containing spaces (though unlikely here)
-    rm -r "$ROOT_DIR/modal-login/temp-data/"*.json 2> /dev/null || true
+    echo_yellow ">> Removing temporary login data..."
+    rm -rf "$ROOT_DIR/modal-login/temp-data" 2> /dev/null || true # Remove the whole folder
 
     # Kill ngrok process if it was started
     if [ -n "$NGROK_PID" ]; then
-         echo_yellow ">> Shutting down ngrok tunnel (PID: $NGROK_PID)..."
-         # Use quotes around PID variable
-         kill "$NGROK_PID" 2>/dev/null || true
-         # Use quotes around file variable
-         rm -f "$NGROK_LOG_FILE" # Clean up ngrok log file
+        echo_yellow ">> Shutting down ngrok tunnel (PID: $NGROK_PID)..."
+        if kill "$NGROK_PID" 2>/dev/null; then
+            echo_yellow "   ngrok process killed."
+        else
+            echo_yellow "   ngrok process might have already exited."
+        fi
+        rm -f "$NGROK_LOG_FILE" 2>/dev/null || true # Clean up ngrok log file
     fi
 
     # Kill the local server process if it was started
     if [ -n "$SERVER_PID" ]; then
-         echo_yellow ">> Shutting down local server (PID: $SERVER_PID)..."
-         # Use quotes around PID variable
-         kill "$SERVER_PID" 2>/dev/null || true
+        echo_yellow ">> Shutting down local server (PID: $SERVER_PID)..."
+        if kill "$SERVER_PID" 2>/dev/null; then
+             echo_yellow "   Local server process killed."
+        else
+             echo_yellow "   Local server process might have already exited."
+        fi
     fi
 
     # Kill all processes belonging to this script's process group as a fallback
-    # This is now safer as traps are disabled
-    echo_yellow ">> Attempting to kill remaining processes in group (final check)..."
-    # Redirect stderr to prevent potential "Terminated" messages to console
-    kill -- -$$ 2>/dev/null || true
+    # Note: This might kill more than intended if not careful, but useful for stopping orphaned children.
+    echo_yellow ">> Attempting to kill any remaining processes in group (final check)..."
+    kill -- -$$ 2>/dev/null || true # Suppress errors if group is already gone
 
     echo_green ">> Cleanup complete."
-    # No need for explicit 'exit 0' here - the script will exit naturally after the trap handler finishes.
 }
 
-# Set trap to call cleanup function on EXIT, INT (Ctrl+C), TERM signals
+# --- Trap Setup ---
+# Execute the cleanup function on script exit, interrupt (Ctrl+C), or termination signal
 trap cleanup EXIT INT TERM
 
+# --- Script Start ---
 echo -e "\033[38;5;224m"
 cat << "EOF"
     ██████  ██            ███████ ██     ██  █████  ██████  ███    ███
@@ -115,263 +100,368 @@ cat << "EOF"
     From Gensyn
 
 EOF
+echo -e "${RESET_TEXT}" # Reset color after banner
 
+# --- Ask User: Connect to Testnet? ---
 while true; do
-    echo -en $GREEN_TEXT
-    read -p ">> Would you like to connect to the Testnet? [Y/n] " yn
-    echo -en $RESET_TEXT
-    yn=${yn:-Y}  # Default to "Y" if the user presses Enter
+    echo -en "${GREEN_TEXT}"
+    read -p ">> Would you like to connect to the Testnet? (Requires ngrok & login) [Y/n] " yn
+    echo -en "${RESET_TEXT}"
+    yn=${yn:-Y} # Default to "Y" if the user presses Enter
     case $yn in
-        [Yy]*)  CONNECT_TO_TESTNET=True && break ;;
-        [Nn]*)  CONNECT_TO_TESTNET=False && break ;;
-        *)  echo_yellow ">>> Please answer yes or no." ;;
+        [Yy]*) CONNECT_TO_TESTNET="True"; break ;;
+        [Nn]*) CONNECT_TO_TESTNET="False"; break ;;
+        *) echo_yellow ">>> Please answer yes (Y) or no (n)." ;;
     esac
 done
 
+# --- Testnet Setup Block ---
 if [ "$CONNECT_TO_TESTNET" = "True" ]; then
-    echo_blue ">> Setting up Testnet connection..."
+    echo_blue ">> Initiating Testnet connection setup..."
 
-    # --- Ngrok Check ---
-    echo_blue ">> Checking for ngrok..."
+    # 1. Check for ngrok
+    echo_blue ">> [1/7] Checking for ngrok..."
     if ! command -v ngrok &> /dev/null; then
-        echo_red "Error: ngrok command not found."
-        echo_yellow "Please install ngrok from https://ngrok.com/download and make sure it's in your PATH."
+        echo_red "Error: 'ngrok' command not found."
+        echo_yellow "Please install ngrok from https://ngrok.com/download"
+        echo_yellow "Ensure the ngrok executable is in your system's PATH."
         exit 1
     else
-        echo_green ">> ngrok found: $(which ngrok)"
+        echo_green ">> ngrok found: $(command -v ngrok)"
     fi
 
-    # --- Ngrok Authtoken ---
-    echo -en $GREEN_TEXT
-    read -p ">> Please enter your ngrok Authtoken (from https://dashboard.ngrok.com/get-started/your-authtoken): " NGROK_AUTHTOKEN
-    echo -en $RESET_TEXT
-    if [ -z "$NGROK_AUTHTOKEN" ]; then
-        echo_red "Error: Ngrok Authtoken is required to create a tunnel."
+    # 2. Get ngrok Authtoken and Configure
+    echo_blue ">> [2/7] Configuring ngrok..."
+    NGROK_AUTHTOKEN=""
+    while [ -z "$NGROK_AUTHTOKEN" ]; do
+        echo -en "${GREEN_TEXT}"
+        read -p ">> Please enter your ngrok Authtoken (find it at https://dashboard.ngrok.com/get-started/your-authtoken): " NGROK_AUTHTOKEN
+        echo -en "${RESET_TEXT}"
+        if [ -z "$NGROK_AUTHTOKEN" ]; then
+            echo_yellow ">>> Ngrok Authtoken cannot be empty. Please paste your token."
+        fi
+    done
+    # Configure ngrok quietly. Show error only if configuration fails.
+    if ! ngrok config add-authtoken "$NGROK_AUTHTOKEN" --log=stderr > /dev/null; then
+        echo_red "Error: Failed to configure ngrok with the provided Authtoken."
+        echo_yellow "Please verify your token and try again."
         exit 1
     fi
-    echo_blue ">> Configuring ngrok with your Authtoken..."
-    # Configure ngrok, redirect errors to stderr, suppress success message on stdout
-    ngrok config add-authtoken "$NGROK_AUTHTOKEN" --log=stderr > /dev/null || { echo_red "Error configuring ngrok token."; exit 1; }
-    echo_green ">> Ngrok configured successfully."
+    echo_green ">> ngrok configured successfully."
 
-    # --- Run modal_login server ---
-    echo_blue ">> Starting local authentication server..."
-    cd modal-login
-    # Check if the yarn command exists; if not, install Yarn.
-    source ~/.bashrc # Ensure environment variables are loaded
+    # 3. Setup Node.js/Yarn Environment
+    echo_blue ">> [3/7] Setting up Node.js & Yarn environment..."
+    cd "$ROOT_DIR/modal-login" || { echo_red "Error: Could not change directory to modal-login."; exit 1; }
+
+    # Ensure necessary env vars are loaded (especially for NVM)
+    source ~/.bashrc 2>/dev/null || true # Source bashrc if it exists
+    source ~/.zshrc 2>/dev/null || true   # Source zshrc if it exists
 
     # Node.js + NVM setup
     if ! command -v node >/dev/null 2>&1; then
-        echo_yellow "Node.js not found. Installing NVM and latest Node.js..."
+        echo_yellow "Node.js not found. Attempting to install NVM and latest Node.js..."
         export NVM_DIR="$HOME/.nvm"
         if [ ! -d "$NVM_DIR" ]; then
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-        fi
-        # Source NVM script for current session
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-       nvm install node # Install latest Node.js LTS
-       # Re-source NVM script after installation to ensure 'node' command is available
-       [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-    else
-        echo_green ">> Node.js is already installed: $(node -v)"
-    fi
-
-    if ! command -v yarn > /dev/null 2>&1; then
-        echo_yellow "Yarn not found. Attempting to install Yarn..."
-        # Detect Ubuntu (including WSL Ubuntu) and install Yarn accordingly
-        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
-            echo_blue "Detected Ubuntu or WSL Ubuntu. Installing Yarn via apt..."
-            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
-            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends yarn
-        else
-            # Fallback for other systems (may require user intervention)
-            echo_yellow "Attempting to install Yarn using npm (requires Node.js/npm). Please ensure Node.js is installed."
-             if command -v npm > /dev/null 2>&1; then
-                 sudo npm install --global yarn
-             else
-                 echo_red "Error: npm is not installed. Cannot install Yarn automatically."
-                 echo_yellow "Please install Yarn manually: https://classic.yarnpkg.com/en/docs/install"
+             echo_blue "Installing NVM..."
+             # Suppress NVM install script output unless there's an error
+             if ! curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null; then
+                 echo_red "Error installing NVM. Please install it manually."
                  exit 1
              fi
         fi
-        # Check again if yarn is now available
-        if ! command -v yarn > /dev/null 2>&1; then
-             echo_red "Error: Yarn installation failed or PATH is not updated. Please install Yarn manually and restart the script."
-             exit 1
+         # Source NVM script for current session *after* potential installation
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" || { echo_red "Error sourcing NVM script. Please check NVM installation."; exit 1; }
+        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+        echo_blue "Installing latest Node.js LTS via NVM..."
+        if ! nvm install --lts; then
+            echo_red "Error installing Node.js via NVM. Please install Node.js manually."
+            exit 1
         fi
+        # Re-source NVM script after installation to ensure 'node' command is available *now*
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        echo_green ">> Node.js installed: $(node -v)"
     else
-        echo_green ">> Yarn is already installed: $(yarn --version)"
+        echo_green ">> Node.js found: $(node -v)"
     fi
 
-    echo_blue ">> Installing project dependencies using yarn..."
-    yarn install
-    echo_blue ">> Starting authentication server process (yarn dev)..."
-    # Run in background and suppress output to console, keep logs minimal
-    yarn dev --silent > /dev/null 2>&1 &
-    SERVER_PID=$!  # Store the process ID
-    echo_green ">> Started local server process: $SERVER_PID"
-    echo_blue ">> Waiting for local server to be ready..."
-    sleep 5 # Give the server a moment to start
+    # Yarn setup
+    if ! command -v yarn > /dev/null 2>&1; then
+        echo_yellow "Yarn not found. Attempting to install Yarn..."
+        if command -v npm > /dev/null 2>&1; then
+            echo_blue "Installing Yarn globally using npm..."
+            # Use sudo only if necessary (check if current user can write to global node_modules)
+             # Simple check: try creating a temp dir where global modules might live
+            GLOBAL_NODE_MODULES=$(npm root -g 2>/dev/null || echo "$HOME/.node_modules_global") # Estimate path
+            if [ ! -w "$(dirname "$GLOBAL_NODE_MODULES")" ]; then
+                echo_yellow "Attempting installation with sudo as global node modules directory might not be writable..."
+                if ! sudo npm install --global yarn; then
+                     echo_red "Error installing Yarn with sudo npm. Please install Yarn manually (https://yarnpkg.com/getting-started/install) and ensure it's in your PATH."
+                     exit 1
+                fi
+            else
+                 if ! npm install --global yarn; then
+                     echo_red "Error installing Yarn with npm. Please install Yarn manually (https://yarnpkg.com/getting-started/install) and ensure it's in your PATH."
+                     exit 1
+                 fi
+            fi
+        else
+             echo_red "Error: npm (Node Package Manager) is required to install Yarn automatically, but npm was not found."
+             echo_yellow "Please install Node.js (which includes npm) or install Yarn manually (https://yarnpkg.com/getting-started/install)."
+             exit 1
+        fi
+        # Check again if yarn is now available
+        if ! command -v yarn > /dev/null 2>&1; then
+             echo_red "Error: Yarn installation attempted, but 'yarn' command is still not found. Check your PATH or install manually."
+             exit 1
+        fi
+        echo_green ">> Yarn installed: $(yarn --version)"
+    else
+        echo_green ">> Yarn found: $(yarn --version)"
+    fi
 
-    # --- Start Ngrok Tunnel ---
-    echo_blue ">> Starting ngrok tunnel for http://localhost:3000..."
-    # Start ngrok in background, log to a file
+    # 4. Install Dependencies and Start Local Server
+    echo_blue ">> [4/7] Installing login server dependencies..."
+    if ! yarn install --silent; then # Use --silent for less verbose output
+        echo_red "Error: 'yarn install' failed. Please check for errors above."
+        exit 1
+    fi
+    echo_green ">> Dependencies installed."
+
+    echo_blue ">> Starting local authentication server (yarn dev)..."
+    # Run in background, redirect stdout/stderr to /dev/null
+    yarn dev > /dev/null 2>&1 &
+    SERVER_PID=$! # Store the process ID
+    # Basic check if process started (PID exists)
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo_red "Error: Failed to start the local server (yarn dev). Check 'modal-login' directory for issues."
+        SERVER_PID="" # Unset PID as it's invalid
+        exit 1
+    fi
+    echo_green ">> Started local server process (PID: $SERVER_PID)."
+    echo_blue ">> Waiting for local server to initialize..."
+    sleep 5 # Give server time to start listening
+
+    # 5. Start Ngrok Tunnel
+    echo_blue ">> [5/7] Starting ngrok tunnel for http://localhost:3000..."
     rm -f "$NGROK_LOG_FILE" # Remove old log file if exists
+    # Start ngrok in background, logging to file, targeting the local server port
     ngrok http 3000 --log "$NGROK_LOG_FILE" &
-    NGROK_PID=$!
-    echo_green ">> Started ngrok process: $NGROK_PID"
+    NGROK_PID=$! # Store ngrok process ID
+    # Basic check if process started
+    if ! kill -0 "$NGROK_PID" 2>/dev/null; then
+        echo_red "Error: Failed to start the ngrok process."
+        echo_yellow "Check if another ngrok process is running or if there are issues with your ngrok installation/configuration."
+        NGROK_PID="" # Unset PID
+        exit 1
+    fi
+    echo_green ">> Started ngrok process (PID: $NGROK_PID)."
 
-    # --- Get Ngrok URL ---
+    # 6. Get Ngrok URL and Wait for Login
+    echo_blue ">> [6/7] Waiting for ngrok tunnel URL and user login..."
     NGROK_URL=""
-    echo_blue ">> Waiting for ngrok tunnel URL..."
-    # Wait up to 30 seconds for ngrok to establish the tunnel and write the URL
-    for i in {1..15}; do
-        # Try getting URL via ngrok API first (more reliable)
-        NGROK_URL=$(curl --silent http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"https://[^"]*' | cut -d'"' -f4)
+    echo_yellow ">> Fetching ngrok public URL (up to 30 seconds)..."
+    for i in {1..15}; do # 15 attempts * 2 seconds = 30 seconds timeout
+        # Method 1: Try ngrok API (more reliable)
+        NGROK_URL=$(curl --silent --max-time 1.5 http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"https://[^"]*' | cut -d'"' -f4 | head -n 1)
+
+        # Method 2: Fallback to parsing log file (if API fails or is slow)
+        if [ -z "$NGROK_URL" ] && [ -f "$NGROK_LOG_FILE" ]; then
+            # Look for lines like 'url=https://....ngrok...' or 'URL:https://....ngrok...'
+            # Prioritize https URLs
+            NGROK_URL=$(grep -Eo 'url=(https://[a-zA-Z0-9.-]+\.ngrok[-a-z.]+)' "$NGROK_LOG_FILE" | head -n 1 | cut -d'=' -f2)
+        fi
 
         if [ -n "$NGROK_URL" ]; then
-            break
+            echo_green ">> Ngrok tunnel URL obtained!"
+            break # Exit loop if URL found
         fi
-        # Fallback: Check log file if API fails or is slow
-        if [ -f "$NGROK_LOG_FILE" ]; then
-             # Look for lines like 'url=https://....ngrok-free.app' or 'URL:https://....ngrok.io'
-            NGROK_URL=$(grep -o 'url=https://[a-zA-Z0-9.-]*\.ngrok[-a-z.]*' "$NGROK_LOG_FILE" | head -n 1 | cut -d'=' -f2)
-        fi
-        if [ -n "$NGROK_URL" ]; then
-            break
-        fi
-        sleep 2 # Wait longer between checks
+        echo_yellow "   Still waiting for ngrok URL... (${i}/15)"
+        sleep 2
     done
 
     if [ -z "$NGROK_URL" ]; then
         echo_red "Error: Could not get ngrok tunnel URL after 30 seconds."
-        echo_yellow "Check ngrok status (maybe run 'ngrok http 3000' manually in another terminal)."
-        echo_yellow "Also check the log file: $NGROK_LOG_FILE"
-        # Cleanup and exit if ngrok failed
-        cleanup
-        exit 1
+        echo_yellow "Troubleshooting steps:"
+        echo_yellow "  1. Check your internet connection."
+        echo_yellow "  2. Manually run 'ngrok http 3000' in another terminal to see errors."
+        echo_yellow "  3. Check the ngrok log file: $NGROK_LOG_FILE"
+        exit 1 # Exit after cleanup (handled by trap)
     fi
 
-    echo_green ">> Ngrok tunnel established!"
-    echo_blue ">> Please use this URL in your browser to login: $NGROK_URL"
-    # No need to try opening automatically, as it's an ngrok URL now.
+    echo_blue "************************************************************************"
+    echo_blue "* ACTION REQUIRED: Please open the following URL in your web browser   *"
+    echo_blue "*                 to log in and authorize the connection:              *"
+    echo_blue "*                                                                      *"
+    echo_green "*   ${NGROK_URL}                                                        *"
+    echo_blue "*                                                                      *"
+    echo_blue "* Waiting for you to complete the login process...                     *"
+    echo_blue "************************************************************************"
 
-    cd .. # Go back to the root directory
-
-    # --- Wait for User Login via Ngrok ---
-    echo_green ">> Waiting for login process to complete via the ngrok URL..."
-    echo_yellow ">> Please complete the login in your browser using the URL: $NGROK_URL"
-    while [ ! -f "modal-login/temp-data/userData.json" ]; do
-        echo_blue ">> Still waiting for login confirmation (userData.json)..."
-        sleep 5  # Wait for 5 seconds before checking again
+    # Wait for userData.json to be created by the login process
+    USER_DATA_FILE="$ROOT_DIR/modal-login/temp-data/userData.json"
+    while [ ! -f "$USER_DATA_FILE" ]; do
+        echo_yellow "   Waiting for login confirmation (checking for '$USER_DATA_FILE')..."
+        sleep 5 # Check every 5 seconds
     done
-    echo_green ">> Found userData.json. Login successful!"
+    echo_green ">> Login detected! Found '$USER_DATA_FILE'."
 
-    # Extract ORG_ID
-    ORG_ID=$(awk 'BEGIN { FS = "\"" } /"orgId"/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json) || { echo_red "Error extracting ORG_ID from userData.json"; exit 1; }
+    # Extract ORG_ID from JSON (using awk for simplicity, jq is more robust if available)
+    # This awk command looks for a line containing "orgId", splits by quotes, and prints the second-to-last field.
+    ORG_ID=$(awk 'BEGIN { FS = "\"" } /"orgId"/ { if (NF >= 4) print $(NF - 1); exit }' "$USER_DATA_FILE")
+
     if [ -z "$ORG_ID" ]; then
-        echo_red "Error: ORG_ID could not be extracted from userData.json. File content:"
-        cat "modal-login/temp-data/userData.json"
+        echo_red "Error: Could not extract ORG_ID from '$USER_DATA_FILE'."
+        echo_yellow "File content:"
+        cat "$USER_DATA_FILE" || echo "(Could not read file)"
         exit 1
     fi
     echo_green ">> Your ORG_ID is set to: $ORG_ID"
 
-    # --- Wait for API Key Activation ---
-    echo_blue ">> Waiting for API key to become activated..."
-    # The check should still query the LOCAL server, as the script runs locally
-    while true; do
-        STATUS=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID")
+    # 7. Wait for API Key Activation
+    echo_blue ">> [7/7] Waiting for API key activation via local server..."
+    ACTIVATION_URL="http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID"
+    MAX_ACTIVATION_ATTEMPTS=24 # 24 * 5 seconds = 2 minutes timeout
+    for (( i=1; i<=MAX_ACTIVATION_ATTEMPTS; i++ )); do
+        # Use curl with silent (-s), fail fast (-f), and max time (-m) options
+        STATUS=$(curl -s -f -m 4 "$ACTIVATION_URL" || echo "error") # Get status or "error"
         if [[ "$STATUS" == "activated" ]]; then
             echo_green ">> API key is activated! Proceeding..."
-            break
+            break # Exit loop on success
+        elif [[ "$STATUS" == "error" ]]; then
+             echo_yellow "   Waiting for API key activation... (Attempt $i/$MAX_ACTIVATION_ATTEMPTS - Could not reach local server at $ACTIVATION_URL)"
         else
-            echo_yellow ">> Waiting for API key to be activated (status: $STATUS)..."
-            sleep 5
+            echo_yellow "   Waiting for API key activation... (Attempt $i/$MAX_ACTIVATION_ATTEMPTS - Status: '$STATUS')"
         fi
+
+        if [ "$i" -eq "$MAX_ACTIVATION_ATTEMPTS" ]; then
+            echo_red "Error: API key did not activate within the timeout period (2 minutes)."
+            echo_yellow "Please check the Gensyn dashboard or support channels."
+            exit 1
+        fi
+        sleep 5
     done
 
+    cd "$ROOT" # Go back to the original root directory
+    echo_green ">> Testnet setup completed successfully."
+
 else
-    echo_blue ">> Skipping Testnet connection and ngrok setup."
+    echo_blue ">> Skipping Testnet connection setup as requested."
+    # ORG_ID remains empty in this case
 fi # End of CONNECT_TO_TESTNET block
 
-# --- Python Environment Setup ---
+# --- Python Environment and Requirements ---
+echo_blue ">> Setting up Python environment and installing requirements..."
+
 pip_install() {
-    pip install --disable-pip-version-check -q -r "$1"
+    echo_blue ">> Installing requirements from: $1"
+    # Use -q for quiet, add --no-warn-script-location to reduce noise
+    if ! pip install --disable-pip-version-check --no-warn-script-location -q -r "$1"; then
+         echo_red "Error: Failed to install requirements from '$1'. Please check pip and the requirements file."
+         exit 1
+    fi
+     echo_green ">> Successfully installed requirements from $1"
 }
 
-echo_green ">> Getting requirements..."
-pip_install "$ROOT"/requirements-hivemind.txt
-pip_install "$ROOT"/requirements.txt
+# Install common requirements first
+pip_install "$ROOT/requirements-hivemind.txt"
+pip_install "$ROOT/requirements.txt"
 
+# Determine config path and install GPU reqs if needed
+CONFIG_PATH=""
 if ! command -v nvidia-smi &> /dev/null; then
-    # You don't have a NVIDIA GPU
-    echo_yellow ">> No NVIDIA GPU detected or nvidia-smi not found. Using CPU configuration."
+    echo_yellow ">> No NVIDIA GPU detected or 'nvidia-smi' not found. Using CPU configuration."
     CONFIG_PATH="$ROOT/hivemind_exp/configs/mac/grpo-qwen-2.5-0.5b-deepseek-r1.yaml"
 elif [ -n "$CPU_ONLY" ]; then
-    # ... or we don't want to use it
     echo_yellow ">> CPU_ONLY flag is set. Using CPU configuration."
     CONFIG_PATH="$ROOT/hivemind_exp/configs/mac/grpo-qwen-2.5-0.5b-deepseek-r1.yaml"
 else
-    # NVIDIA GPU found
-    echo_green ">> NVIDIA GPU detected. Installing GPU requirements..."
-    pip_install "$ROOT"/requirements_gpu.txt
+    echo_green ">> NVIDIA GPU detected. Installing GPU-specific requirements..."
+    pip_install "$ROOT/requirements_gpu.txt"
     CONFIG_PATH="$ROOT/hivemind_exp/configs/gpu/grpo-qwen-2.5-0.5b-deepseek-r1.yaml"
     echo_green ">> Using GPU configuration."
 fi
 
-echo_green ">> Done installing requirements!"
+if [ ! -f "$CONFIG_PATH" ]; then
+    echo_red "Error: Configuration file not found at '$CONFIG_PATH'."
+    exit 1
+fi
+echo_green ">> Configuration file set to: $CONFIG_PATH"
+echo_green ">> Requirements installation complete."
 
 # --- Hugging Face Token ---
-HF_TOKEN=${HF_TOKEN:-""}
-if [ -n "${HF_TOKEN}" ]; then # Check if HF_TOKEN is already set and use if so. Else give user a prompt to choose.
-    echo_green ">> Using existing HF_TOKEN environment variable."
-    HUGGINGFACE_ACCESS_TOKEN=${HF_TOKEN}
+echo_blue ">> Checking Hugging Face Hub integration..."
+HF_TOKEN=${HF_TOKEN:-""} # Check environment variable first
+HUGGINGFACE_ACCESS_TOKEN="None" # Default to None
+
+if [ -n "${HF_TOKEN}" ]; then
+    echo_green ">> Using Hugging Face token from HF_TOKEN environment variable."
+    HUGGINGFACE_ACCESS_TOKEN="${HF_TOKEN}"
 else
-    echo -en $GREEN_TEXT
-    read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
-    echo -en $RESET_TEXT
-    yn=${yn:-N} # Default to "N" if the user presses Enter
-    case $yn in
+    echo -en "${GREEN_TEXT}"
+    read -p ">> Would you like to push trained models to the Hugging Face Hub? [y/N] " yn_hf
+    echo -en "${RESET_TEXT}"
+    yn_hf=${yn_hf:-N} # Default to "N"
+    case $yn_hf in
         [Yy]*)
-             echo -en $YELLOW_TEXT
-             read -p ">>> Enter your Hugging Face access token (write permission required): " HUGGINGFACE_ACCESS_TOKEN
-             echo -en $RESET_TEXT
+             echo -en "${YELLOW_TEXT}"
+             # Use -s for silent input for the token
+             read -sp ">>> Enter your Hugging Face access token (needs 'write' permission): " HUGGINGFACE_ACCESS_TOKEN_INPUT
+             echo # Print a newline after silent input
+             echo -en "${RESET_TEXT}"
+             if [ -z "$HUGGINGFACE_ACCESS_TOKEN_INPUT" ]; then
+                 echo_yellow ">>> No token entered. Models will NOT be pushed."
+                 HUGGINGFACE_ACCESS_TOKEN="None"
+             else
+                 HUGGINGFACE_ACCESS_TOKEN="$HUGGINGFACE_ACCESS_TOKEN_INPUT"
+                 echo_green ">> Hugging Face token received. Models will be pushed if training is successful."
+             fi
              ;;
-        [Nn]*) HUGGINGFACE_ACCESS_TOKEN="None" ;;
-        *) echo_yellow ">>> No valid answer given. Models will NOT be pushed to Hugging Face Hub." && HUGGINGFACE_ACCESS_TOKEN="None" ;;
+        [Nn]*)
+             echo_blue ">> Models will NOT be pushed to Hugging Face Hub."
+             HUGGINGFACE_ACCESS_TOKEN="None"
+             ;;
+        *)
+             echo_yellow ">>> Invalid input. Models will NOT be pushed to Hugging Face Hub."
+             HUGGINGFACE_ACCESS_TOKEN="None"
+             ;;
     esac
 fi
 
 # --- Start Training ---
-echo_green ">> Good luck in the swarm!"
-echo_blue ">> Post about rl-swarm on X/twitter! --> https://tinyurl.com/swarmtweet"
-echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
+echo_green ">> All setup complete. Starting the training process..."
+echo_blue ">> Good luck in the swarm! Remember to star the repo: https://github.com/gensyn-ai/rl-swarm"
+echo_blue ">> Follow updates on X/Twitter: https://tinyurl.com/swarmtweet"
 
-echo_blue ">> Starting the main training process..."
+# Prepare arguments for the python script
+PYTHON_ARGS=(
+    -m hivemind_exp.gsm8k.train_single_gpu
+    --hf_token "$HUGGINGFACE_ACCESS_TOKEN"
+    --identity_path "$IDENTITY_PATH"
+    --config "$CONFIG_PATH"
+)
 
-# Use ORG_ID if Testnet was connected, otherwise use direct P2P args
+# Add arguments based on whether we connected to Testnet or not
 if [ -n "$ORG_ID" ]; then
-    echo_blue ">> Running trainer with Modal/Testnet configuration (ORG_ID: $ORG_ID)..."
-    python -m hivemind_exp.gsm8k.train_single_gpu \
-        --hf_token "$HUGGINGFACE_ACCESS_TOKEN" \
-        --identity_path "$IDENTITY_PATH" \
-        --modal_org_id "$ORG_ID" \
-        --config "$CONFIG_PATH"
+    echo_blue ">> Running trainer with Testnet configuration (using ORG_ID: $ORG_ID)..."
+    PYTHON_ARGS+=(--modal_org_id "$ORG_ID")
 else
     echo_blue ">> Running trainer with direct P2P configuration..."
-    python -m hivemind_exp.gsm8k.train_single_gpu \
-        --hf_token "$HUGGINGFACE_ACCESS_TOKEN" \
-        --identity_path "$IDENTITY_PATH" \
-        --public_maddr "$PUB_MULTI_ADDRS" \
-        --initial_peers "$PEER_MULTI_ADDRS" \
-        --host_maddr "$HOST_MULTI_ADDRS" \
-        --config "$CONFIG_PATH"
+    PYTHON_ARGS+=(
+        --public_maddr "$PUB_MULTI_ADDRS"
+        --initial_peers "$PEER_MULTI_ADDRS"
+        --host_maddr "$HOST_MULTI_ADDRS"
+    )
 fi
 
-echo_green ">> Training process finished or was interrupted."
-# The cleanup function will be called automatically on exit due to the trap
+# Execute the python script
+echo_blue ">> Executing command: python ${PYTHON_ARGS[*]}"
+if ! python "${PYTHON_ARGS[@]}"; then
+    echo_red "Error: The Python training script exited with a non-zero status."
+    # Cleanup will run automatically due to the trap on EXIT
+    exit 1 # Ensure script exits with error status
+fi
 
-wait # Keep script potentially running if python command was backgrounded (though it isn't here)
-# If python runs in foreground, script ends when python ends, triggering cleanup.
+echo_green ">> Python training script finished successfully."
+# Cleanup will run automatically due to the trap on EXIT
+exit 0 # Explicitly exit with success status
